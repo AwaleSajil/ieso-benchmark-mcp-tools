@@ -268,3 +268,4 @@ response = client.responses.create(
 | `OPENAI_API_KEY` | — | **Required.** Used to embed incoming queries. |
 | `WORLDVIEW_JSON_PATH` | `worldview_unified_final.json` | Path to the layer catalog JSON. |
 | `HYBRID_ALPHA` | `0.7` | Weight of vector vs BM25 score. `1.0` = pure vector, `0.0` = pure BM25. |
+| `LOG_LEVEL` | `INFO` | Logging verbosity. Set to `DEBUG` in FastMCP Cloud to view detailed vector/BM25 diagnostics. |

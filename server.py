@@ -62,8 +62,11 @@ from rank_bm25 import BM25Okapi
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_resolved_log_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(level=_resolved_log_level)
 logger = logging.getLogger(__name__)
+logger.info("Logging initialized at level=%s", logging.getLevelName(_resolved_log_level))
 
 # ── FastMCP server ────────────────────────────────────────────────────────────
 
@@ -98,6 +101,7 @@ _layer_id_map: dict[str, dict[str, Any]] = {}  # layer_id → layer dict  (O(1) 
 _bm25:        BM25Okapi | None = None
 _embeddings:  np.ndarray | None = None    # shape (N, D), float32; None = not available
 _index_ready  = False
+_vector_disabled_reason: str | None = None
 
 
 def _layer_text(layer: dict[str, Any]) -> str:
@@ -115,7 +119,7 @@ def _layer_text(layer: dict[str, Any]) -> str:
 
 
 def _build_index() -> None:
-    global _layers, _layer_id_map, _bm25, _embeddings, _index_ready
+    global _layers, _layer_id_map, _bm25, _embeddings, _index_ready, _vector_disabled_reason
 
     if _index_ready:
         return
@@ -166,13 +170,20 @@ def _build_index() -> None:
             norms = np.linalg.norm(_embeddings, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             _embeddings /= norms
+            _vector_disabled_reason = None
             logger.info(f"  Embedding matrix: {_embeddings.shape}")
         else:
+            _vector_disabled_reason = (
+                f"{missing} layer(s) missing from embedding file"
+            )
             logger.warning(
                 f"  {missing} layer(s) missing from embedding file — "
                 "vector search disabled, using BM25-only."
             )
     else:
+        _vector_disabled_reason = (
+            f"Embedding archive not found: {os.path.basename(EMBEDDINGS_PATH)}"
+        )
         logger.warning(
             f"  {os.path.basename(EMBEDDINGS_PATH)} not found — "
             "using BM25-only search. Run generate_embeddings.py to create it."
@@ -187,10 +198,11 @@ _openai_client: OpenAI | None = None
 
 
 def _get_openai() -> OpenAI | None:
-    global _openai_client
+    global _openai_client, _vector_disabled_reason
     if _openai_client is None:
         key = os.getenv("OPENAI_API_KEY")
         if not key:
+            _vector_disabled_reason = "OPENAI_API_KEY not set"
             logger.warning("OPENAI_API_KEY not set — vector search disabled")
             return None
         _openai_client = OpenAI(api_key=key)
@@ -199,15 +211,22 @@ def _get_openai() -> OpenAI | None:
 
 def _embed_query(query: str) -> np.ndarray | None:
     """Return a unit-norm embedding vector for the query, or None on failure."""
+    global _vector_disabled_reason
     client = _get_openai()
-    if client is None or _embeddings is None:
+    if _embeddings is None:
+        if _vector_disabled_reason is None:
+            _vector_disabled_reason = "Embedding matrix not loaded"
+        return None
+    if client is None:
         return None
     try:
         resp = client.embeddings.create(model=EMBED_MODEL, input=query)
         vec = np.array(resp.data[0].embedding, dtype=np.float32)
         norm = np.linalg.norm(vec)
+        _vector_disabled_reason = None
         return vec / norm if norm > 0 else vec
     except Exception as e:
+        _vector_disabled_reason = f"Embedding request failed: {e}"
         logger.warning(f"Embedding failed: {e}")
         return None
 
@@ -250,9 +269,23 @@ def _hybrid_search(
         vec_scores = (_embeddings @ q_vec).astype(np.float32)
         vec_norm = _normalise(vec_scores)
         alpha = HYBRID_ALPHA
+        logger.info(
+            "Hybrid search mode=hybrid alpha=%.2f limit=%d query_terms=%d",
+            alpha, limit, len(tokens),
+        )
+        logger.debug(
+            "Vector enabled: embeddings_shape=%s",
+            tuple(_embeddings.shape),
+        )
     else:
         vec_norm = np.zeros(n, dtype=np.float32)
         alpha = 0.0   # fall back to pure BM25
+        logger.info(
+            "Hybrid search mode=bm25_only reason=%s limit=%d query_terms=%d",
+            _vector_disabled_reason or "unknown",
+            limit,
+            len(tokens),
+        )
 
     hybrid = alpha * vec_norm + (1.0 - alpha) * bm25_norm
 
