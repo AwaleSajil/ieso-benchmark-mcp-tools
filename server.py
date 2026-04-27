@@ -14,8 +14,8 @@ Search pipeline (search_worldview_layers):
   3. Cosine-similarity against all pre-computed layer embeddings → vector_score.
   4. BM25 keyword score against layer text fields → bm25_score.
   5. Hybrid score = ALPHA * vector_score + (1 - ALPHA) * bm25_score.
-  6. Post-filter by date range (optional acquisition dates).
-  7. Return top-k layers.
+  6. Return top-k layers.
+  Temporal validation is handled separately by validate_temporal_coverage.
 
 If the embedding file is absent, the tool falls back to BM25-only and logs a warning.
 Run generate_embeddings.py once to create the .npy file.
@@ -385,8 +385,6 @@ def _date_in_range(
 @mcp.tool()
 async def search_worldview_layers(
     query: str,
-    acquisition_start_date: str = "",
-    acquisition_end_date: str = "",
     limit: int = 10,
 ) -> dict[str, Any]:
     """Search NASA Worldview layers using a free-text query.
@@ -402,29 +400,35 @@ async def search_worldview_layers(
       2. **Query validation** — pass a generated benchmark query to verify
          that the intended Worldview layer still ranks at the top.
 
-    Temporal post-filtering is applied when acquisition dates are provided:
-    only layers whose active date range overlaps the requested window are
-    returned.
+    Use ``validate_temporal_coverage`` separately to confirm the matched
+    layer was active during the paper's acquisition window.
 
     Vector search uses pre-computed embeddings loaded from a companion
     .npz file (created by generate_embeddings.py).  If the file is absent,
     the tool falls back to BM25-only and notes this in the ``search_mode``
     field of each result.
 
+    When composing a metadata-derived query, include as many of these
+    dimensions as the extraction metadata provides:
+      - Satellite data name   (e.g. "MODIS Terra", "Landsat 8")
+      - Sensor name           (e.g. "MODIS", "VIIRS", "AIRS")
+      - Variable/measurement  (e.g. "land surface temperature", "NDVI")
+      - Phenomenon            (e.g. "wildfire", "coral bleaching", "drought")
+      - Science topic         (e.g. "fire ecology", "oceanography")
+      - Spatial resolution    (e.g. "250m", "1km", "4km")
+      - Temporal resolution   (e.g. "daily", "8-day", "monthly")
+      - Location coverage     (e.g. "Amazon basin", "global", "Arctic")
+      - Processing level      (e.g. "L2", "L3", "gridded")
+
     Args:
         query:  Free-text search string describing the data need.
                 Examples:
                   - "land surface reflectance burned area wildfire MODIS
-                     fire ecology Amazon basin"  (metadata-derived)
+                     Terra fire ecology 500m 8-day Amazon basin L3"
+                     (metadata-derived, include all available dimensions)
                   - "Show me daily sea surface temperature anomalies in the
                      Gulf of Mexico for summer 2020"  (user-style query)
                   - "vegetation index drought monitoring sub-Saharan Africa"
-        acquisition_start_date:
-                Optional start of the temporal window (YYYY, YYYY-MM, or
-                YYYY-MM-DD).  When provided together with acquisition_end_date,
-                layers that do not overlap this window are filtered out.
-        acquisition_end_date:
-                Optional end of the temporal window (same formats).
         limit:  Max layers to return (default 10).
 
     Returns:
@@ -435,7 +439,6 @@ async def search_worldview_layers(
                                     relevance_score, vector_score, bm25_score,
                                     search_mode ("hybrid" | "bm25_only")
         query_used:               the query string that was searched
-        acquisition_dates_parsed: dates derived from the optional date args
         total_layers_in_catalog:  size of the loaded layer index
     """
     query = (query or "").strip()
@@ -445,18 +448,14 @@ async def search_worldview_layers(
             "matched_layers": [],
         }
 
-    raw_dates = [d.strip() for d in [acquisition_start_date, acquisition_end_date] if d.strip()]
-    norm_dates = _normalise_dates(raw_dates)
-
     try:
-        matched = _hybrid_search(query, norm_dates, limit)
+        matched = _hybrid_search(query, [], limit)
     except FileNotFoundError as e:
         return {"error": str(e), "matched_layers": []}
 
     return {
         "matched_layers": matched,
         "query_used": query,
-        "acquisition_dates_parsed": norm_dates,
         "total_layers_in_catalog": len(_layers),
     }
 

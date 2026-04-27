@@ -1,6 +1,6 @@
 # IESO Benchmark Tools
 
-FastMCP server exposing two MCP tools for the **IESO agent synthetic benchmark generation pipeline**. The tools are called by agents built in OpenAI Agent Builder to map satellite dataset metadata (extracted from scientific papers) to NASA Worldview layers and validate their temporal coverage.
+FastMCP server exposing two MCP tools for the **IESO agent synthetic benchmark generation pipeline**. The tools are called by agents built in OpenAI Agent Builder to find NASA Worldview layers matching any free-text query and validate their temporal coverage.
 
 ---
 
@@ -15,11 +15,12 @@ PDF Paper
 Extraction Agent (OpenAI Agent Builder)
     │  outputs datasets[] with satellite metadata
     ▼
-Benchmark Agent (OpenAI Agent Builder)
-    ├── map_metadata_to_worldview_layers(dataset)  ←── this server
-    │       returns matched layer IDs + scores
-    ├── validate_temporal_coverage(layer_id, acquisition_start_date, acquisition_end_date) ←── this server
-    │       returns complete/partial/no overlap for the requested acquisition window
+Query Generation Agent (OpenAI Agent Builder)
+    ├── search_worldview_layers(query, start?, end?)  ←── this server
+    │       1. compose search text from metadata → find best layer
+    │       2. pass generated query → verify layer still ranks #1
+    ├── validate_temporal_coverage(layer_id, start, end)  ←── this server
+    │       returns complete/partial/no overlap
     └── generates benchmark query (no dataset names, natural language)
 ```
 
@@ -27,26 +28,35 @@ Benchmark Agent (OpenAI Agent Builder)
 
 ## Tools
 
-### `map_metadata_to_worldview_layers`
+### `search_worldview_layers`
 
-Maps one dataset object (from the extraction agent) to NASA Worldview layer IDs using hybrid search (vector + BM25) over the local layer catalog.
+Searches NASA Worldview layers using any **free-text query** via hybrid search (vector + BM25) over the local layer catalog. Use it for two purposes:
 
-**Input** — one item from the extraction agent's `datasets` array:
+1. **Metadata-to-layer mapping** — compose a search string from extraction-agent metadata fields and find the best matching Worldview layer.
+2. **Query validation** — pass a generated benchmark query to verify the intended Worldview layer still ranks at the top.
+
+**Input:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | yes | Free-text search string (metadata-derived or user-style query) |
+| `limit` | int | no | Max layers to return (default 10) |
+
+**Example — metadata-derived search:**
 
 ```json
 {
-  "Satellite data name":    "MODIS Terra",
-  "Sensor Name":            "MODIS",
-  "Variable / Measurement": "land surface temperature",
-  "Phenomenon":             "urban heat island",
-  "Science topic":          "atmospheric science",
-  "Spatial Resolution":     "1km",
-  "Temporal Resolution":    "daily",
-  "Acquisition Start Date": "2019",
-  "Acquisition End Date":   "2021",
-  "Location Coverage":      "Indian subcontinent",
-  "Processing Level":       "L3",
-  "How used":               "to quantify surface warming in cities"
+  "query": "land surface temperature urban heat island MODIS Terra atmospheric science 1km daily Indian subcontinent L3",
+  "limit": 5
+}
+```
+
+**Example — generated query validation:**
+
+```json
+{
+  "query": "Show me daily thermal maps of surface warming in major cities across South Asia from 2019 to 2021",
+  "limit": 5
 }
 ```
 
@@ -71,8 +81,6 @@ Maps one dataset object (from the extraction agent) to NASA Worldview layer IDs 
     }
   ],
   "query_used": "land surface temperature urban heat island MODIS Terra ...",
-  "acquisition_dates_parsed": ["2019-07-15", "2020-07-15", "2021-07-15"],
-  "dataset_echo": { ... },
   "total_layers_in_catalog": 1218
 }
 ```
@@ -84,6 +92,14 @@ Maps one dataset object (from the extraction agent) to NASA Worldview layer IDs 
 Checks overlap between a requested acquisition window and a specific Worldview layer's temporal coverage.
 
 **Input:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `layer_id` | string | yes | Exact Worldview layer ID |
+| `acquisition_start_date` | string | yes | Start of requested window (YYYY, YYYY-MM, or YYYY-MM-DD) |
+| `acquisition_end_date` | string | yes | End of requested window (same formats) |
+
+**Example:**
 
 ```json
 {
@@ -122,12 +138,10 @@ Possible `overlap_type` values:
 
 ## Search architecture
 
-Queries arrive as plain text. The tool embeds them at call time and runs hybrid search locally — no external vector database required.
+Queries arrive as free text. The tool embeds them at call time and runs hybrid search locally — no external vector database required.
 
 ```
-Tool receives plain-text dataset fields
-    │
-    ├── Build query string from fields
+Tool receives free-text query
     │
     ├── Embed query → OpenAI text-embedding-3-small (1 API call, ~50ms)
     │
@@ -137,7 +151,7 @@ Tool receives plain-text dataset fields
     │
     ├── Hybrid score = 0.7 × vector + 0.3 × BM25
     │
-    └── Post-filter by Acquisition Start/End Date range → return top-k
+    └── Return top-k layers (temporal validation done separately via validate_temporal_coverage)
 ```
 
 Both indexes (BM25 + numpy embedding matrix) are built once at server startup and kept in memory for the lifetime of the process.
