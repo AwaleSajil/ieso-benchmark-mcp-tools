@@ -7,13 +7,14 @@ file (worldview_unified_final.json).  Pre-computed embeddings are loaded from
 a companion binary file (<stem>_embeddings.npy) created by generate_embeddings.py.
 Hybrid search (cosine-similarity + BM25) is executed in-process with numpy + rank_bm25.
 
-Search pipeline (map_metadata_to_worldview_layers):
-  1. Build a text query from the extraction-agent dataset fields.
+Search pipeline (search_worldview_layers):
+  1. Accept a free-text query (composed by the agent from metadata or a
+     generated benchmark query being validated).
   2. Embed the query with OpenAI text-embedding-3-small.
   3. Cosine-similarity against all pre-computed layer embeddings → vector_score.
   4. BM25 keyword score against layer text fields → bm25_score.
   5. Hybrid score = ALPHA * vector_score + (1 - ALPHA) * bm25_score.
-  6. Post-filter by date range (Acquisition Start/End Date from the paper).
+  6. Post-filter by date range (optional acquisition dates).
   7. Return top-k layers.
 
 If the embedding file is absent, the tool falls back to BM25-only and logs a warning.
@@ -74,8 +75,9 @@ mcp = FastMCP(
     "ieso-benchmark-tools",
     instructions=(
         "Tools that support synthetic benchmark generation for the IESO agent. "
-        "Use map_metadata_to_worldview_layers to find Worldview layers that match "
-        "metadata extracted from a scientific paper. "
+        "Use search_worldview_layers to find Worldview layers matching any "
+        "free-text query — whether composed from extraction-agent metadata or "
+        "from a generated benchmark query you want to validate. "
         "Use validate_temporal_coverage to confirm a layer was active during the "
         "paper's acquisition dates before finalising a benchmark query."
     ),
@@ -377,43 +379,53 @@ def _date_in_range(
     return True
 
 
-# ── Tool 1: map_metadata_to_worldview_layers ──────────────────────────────────
+# ── Tool 1: search_worldview_layers ────────────────────────────────────────────
 
 
 @mcp.tool()
-async def map_metadata_to_worldview_layers(
-    dataset: dict[str, str],
+async def search_worldview_layers(
+    query: str,
+    acquisition_start_date: str = "",
+    acquisition_end_date: str = "",
     limit: int = 10,
 ) -> dict[str, Any]:
-    """Map one extraction-agent dataset object to NASA Worldview layer IDs.
+    """Search NASA Worldview layers using a free-text query.
 
-    Pass a single item from the extraction agent's ``datasets`` array directly.
-    The tool reads the exact field names produced by the extraction agent,
-    builds a search query, and runs hybrid (vector + BM25) search over the
-    in-memory Worldview layer catalog (loaded from worldview_unified_final.json).
+    Accepts any natural-language description — a scientific question, a list of
+    variables and instruments, or a user-style query — and returns the best-
+    matching Worldview layers via hybrid (vector + BM25) search over the
+    in-memory layer catalog (worldview_unified_final.json).
+
+    Use this tool for TWO purposes:
+      1. **Metadata-to-layer mapping** — compose a search string from the
+         extraction-agent metadata and find the best Worldview layer match.
+      2. **Query validation** — pass a generated benchmark query to verify
+         that the intended Worldview layer still ranks at the top.
+
+    Temporal post-filtering is applied when acquisition dates are provided:
+    only layers whose active date range overlaps the requested window are
+    returned.
 
     Vector search uses pre-computed embeddings loaded from a companion
-    .npy file (created by generate_embeddings.py).  If the file is absent,
+    .npz file (created by generate_embeddings.py).  If the file is absent,
     the tool falls back to BM25-only and notes this in the ``search_mode``
     field of each result.
 
     Args:
-        dataset: One dataset object from the extraction agent, e.g.:
-            {
-              "Satellite data name":    "MODIS Terra",
-              "Sensor Name":            "MODIS",
-              "Variable / Measurement": "land surface reflectance",
-              "Phenomenon":             "burned area wildfire",
-              "Science topic":          "fire ecology",
-              "Spatial Resolution":     "500m",
-              "Temporal Resolution":    "8-day",
-              "Acquisition Start Date": "2019",
-              "Acquisition End Date":   "2021",
-              "Location Coverage":      "Amazon basin",
-              "Processing Level":       "L3",
-              "How used":               "to map fire-affected areas"
-            }
-        limit: Max layers to return (default 5).
+        query:  Free-text search string describing the data need.
+                Examples:
+                  - "land surface reflectance burned area wildfire MODIS
+                     fire ecology Amazon basin"  (metadata-derived)
+                  - "Show me daily sea surface temperature anomalies in the
+                     Gulf of Mexico for summer 2020"  (user-style query)
+                  - "vegetation index drought monitoring sub-Saharan Africa"
+        acquisition_start_date:
+                Optional start of the temporal window (YYYY, YYYY-MM, or
+                YYYY-MM-DD).  When provided together with acquisition_end_date,
+                layers that do not overlap this window are filtered out.
+        acquisition_end_date:
+                Optional end of the temporal window (same formats).
+        limit:  Max layers to return (default 10).
 
     Returns:
         matched_layers:           list of layer dicts, each with:
@@ -422,33 +434,19 @@ async def map_metadata_to_worldview_layers(
                                     instrument, platform, tags,
                                     relevance_score, vector_score, bm25_score,
                                     search_mode ("hybrid" | "bm25_only")
-        query_used:               natural-language string that was searched
-        acquisition_dates_parsed: dates derived from "Acquisition Start Date"
-                                  and "Acquisition End Date"
-        dataset_echo:             the input dataset (for traceability)
+        query_used:               the query string that was searched
+        acquisition_dates_parsed: dates derived from the optional date args
         total_layers_in_catalog:  size of the loaded layer index
     """
-    satellite  = (dataset.get("Satellite data name") or "").strip()
-    sensor     = (dataset.get("Sensor Name") or "").strip()
-    variable   = (dataset.get("Variable / Measurement") or "").strip()
-    phenomenon = (dataset.get("Phenomenon") or "").strip()
-    topic      = (dataset.get("Science topic") or "").strip()
-    location   = (dataset.get("Location Coverage") or "").strip()
-    acq_start  = (dataset.get("Acquisition Start Date") or "").strip()
-    acq_end    = (dataset.get("Acquisition End Date") or "").strip()
-
-    query = " ".join(p for p in [variable, phenomenon, satellite, sensor, topic, location] if p)
+    query = (query or "").strip()
     if not query:
         return {
-            "error": (
-                "dataset must contain at least one non-empty field among: "
-                "'Variable / Measurement', 'Phenomenon', 'Satellite data name', "
-                "'Sensor Name', 'Science topic'."
-            ),
+            "error": "query must be a non-empty string.",
             "matched_layers": [],
         }
 
-    norm_dates = _normalise_dates([d for d in [acq_start, acq_end] if d])
+    raw_dates = [d.strip() for d in [acquisition_start_date, acquisition_end_date] if d.strip()]
+    norm_dates = _normalise_dates(raw_dates)
 
     try:
         matched = _hybrid_search(query, norm_dates, limit)
@@ -459,7 +457,6 @@ async def map_metadata_to_worldview_layers(
         "matched_layers": matched,
         "query_used": query,
         "acquisition_dates_parsed": norm_dates,
-        "dataset_echo": dataset,
         "total_layers_in_catalog": len(_layers),
     }
 
