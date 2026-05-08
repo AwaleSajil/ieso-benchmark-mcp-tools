@@ -67,6 +67,7 @@ Searches NASA Worldview layers using any **free-text query** via hybrid search (
   "matched_layers": [
     {
       "layer_id": "MODIS_Terra_Land_Surface_Temp_Day",
+      "measurement_id": "Land Surface Temperature",
       "display_name": "...",
       "description": "...",
       "date_range_start": "2000-02-24",

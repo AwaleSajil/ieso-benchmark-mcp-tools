@@ -314,6 +314,7 @@ def _hybrid_search(
 
         results.append({
             "layer_id":        layer.get("layer_id"),
+            "measurement_id":  layer.get("measurement_id"),
             "display_name":    layer.get("display_name"),
             "description":     (layer.get("description") or "")[:400],
             "date_range_start": l_start_str,
@@ -433,11 +434,12 @@ async def search_worldview_layers(
 
     Returns:
         matched_layers:           list of layer dicts, each with:
-                                    layer_id, display_name, description,
-                                    date_range_start, date_range_end,
-                                    instrument, platform, tags,
-                                    relevance_score, vector_score, bm25_score,
-                                    search_mode ("hybrid" | "bm25_only")
+                                    layer_id, measurement_id, display_name,
+                                    description, date_range_start,
+                                    date_range_end, instrument, platform,
+                                    tags, relevance_score, vector_score,
+                                    bm25_score, search_mode
+                                    ("hybrid" | "bm25_only")
         query_used:               the query string that was searched
         total_layers_in_catalog:  size of the loaded layer index
     """
